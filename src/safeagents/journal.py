@@ -19,12 +19,21 @@ Arguments can hold secrets, so the file is readable by its owner only.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import time
+from collections.abc import Iterator
 from pathlib import Path
 
 from .constants import DEFAULT_JOURNAL_PATH
+
+# File locking has no portable standard-library API: Windows has msvcrt.locking,
+# POSIX has fcntl.flock. Each module exists only on its own platform (see runs.py).
+if os.name == "nt":
+    import msvcrt
+else:
+    import fcntl
 
 
 def read(path: Path = DEFAULT_JOURNAL_PATH) -> list[dict]:
@@ -44,22 +53,47 @@ def read(path: Path = DEFAULT_JOURNAL_PATH) -> list[dict]:
     return entries
 
 
+@contextlib.contextmanager
+def _locked(path: Path) -> Iterator[None]:
+    """Holds an exclusive lock on a sibling lock file for the critical section.
+
+    Numbering and the append must be atomic across processes: every background proxy
+    writes to the same journal by default, so two of them picking the next id from the
+    file at the same time would otherwise hand out the same number.
+    """
+    lock_path = path.with_name(path.name + ".lock")
+    file_descriptor = os.open(lock_path, os.O_WRONLY | os.O_CREAT, 0o600)
+    try:
+        if os.name == "nt":
+            msvcrt.locking(file_descriptor, msvcrt.LK_LOCK, 1)
+        else:
+            fcntl.flock(file_descriptor, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            if os.name == "nt":
+                msvcrt.locking(file_descriptor, msvcrt.LK_UNLCK, 1)
+            else:
+                fcntl.flock(file_descriptor, fcntl.LOCK_UN)
+    finally:
+        os.close(file_descriptor)
+
+
 class Journal:
     """Appends calls to a JSON-lines file, numbering them after those already in it."""
 
     def __init__(self, path: Path = DEFAULT_JOURNAL_PATH) -> None:
         self.path = Path(path)
-        self._next_id: int | None = None
 
     def append(self, **entry: object) -> int:
-        if self._next_id is None:
-            self.path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        self.path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        # The next id is read from the file under the lock, not cached in memory: a cached
+        # counter goes stale the moment another process (or Journal) appends to the same file.
+        with _locked(self.path):
             existing_ids = [existing["id"] for existing in read(self.path)]
-            self._next_id = max(existing_ids, default=0) + 1
-        call_id = self._next_id
-        self._next_id += 1
-        line = json.dumps({"id": call_id, "time": time.time(), **entry}, ensure_ascii=False)
-        file_descriptor = os.open(self.path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
-        with os.fdopen(file_descriptor, "a", encoding="utf-8") as file:
-            file.write(line + "\n")
+            call_id = max(existing_ids, default=0) + 1
+            line = json.dumps({"id": call_id, "time": time.time(), **entry}, ensure_ascii=False)
+            file_descriptor = os.open(self.path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+            with os.fdopen(file_descriptor, "a", encoding="utf-8") as file:
+                file.write(line + "\n")
         return call_id

@@ -146,15 +146,22 @@ class Guard:
         scanner = self.config.scanner
         if scanner is None:
             return Review()
-        if self._steps is None:
-            self._steps = recent(history(self.request))
-        signals = scanner.signals(self._steps, self._calls)
+        # atif-scan is synchronous and CPU-bound (regex and rules over the whole trace),
+        # so run it in a worker thread: on the single proxy event loop a slow scan would
+        # otherwise stall every other in-flight request until it finished.
+        signals = await asyncio.to_thread(self._signals, scanner)
         severe_signals = [signal for signal in signals if signal.severity >= self.config.block_severity]
         if severe_signals:
             return Review("atif-scan: " + ", ".join(str(signal) for signal in severe_signals), signals)
         if not signals:
             return Review()
         return await self._judge(name, args, signals)
+
+    def _signals(self, scanner: Scanner) -> list[Signal]:
+        """The scanner's findings on the calls so far. Synchronous; called via a thread."""
+        if self._steps is None:
+            self._steps = recent(history(self.request))
+        return scanner.signals(self._steps, self._calls)
 
     async def _judge(self, name: str, args: str, signals: list[Signal]) -> Review:
         judge = self.config.judge

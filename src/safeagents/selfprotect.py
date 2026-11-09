@@ -30,6 +30,7 @@ them off for a run that genuinely needs them.
 
 from __future__ import annotations
 
+import json
 import re
 
 # `safeagents start`/`stop` change which proxies run; a `safeagents` invocation carrying
@@ -65,12 +66,29 @@ _RULES = (
 )
 
 
+def _decoded(args: str) -> str:
+    """The arguments as the tool decodes them: JSON escapes (`\\u0073afeagents`) resolved."""
+    try:
+        return json.dumps(json.loads(args), ensure_ascii=False)
+    except ValueError:
+        return args
+
+
 def self_protection_reason(name: str, args: str) -> str | None:
     """Why a call attacks the proxy guarding it, if it does; otherwise None.
 
     `args` is the call's raw JSON arguments, so a path or command in any field is seen.
+    Both the raw text and its decoded form are checked: the tool runs the decoded one.
     """
-    text = args or ""
+    raw = args or ""
+    for text in dict.fromkeys((raw, _decoded(raw))):
+        reason = _reason(text)
+        if reason is not None:
+            return reason
+    return None
+
+
+def _reason(text: str) -> str | None:
     for matches, why in _RULES:
         if matches(text):
             return f"self-protection: {why}"

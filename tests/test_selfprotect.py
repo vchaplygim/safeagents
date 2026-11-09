@@ -11,9 +11,12 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import json
+
 import pytest
 
 from safeagents.guard import Config, analyze_sync
+from safeagents.selfprotect import self_protection_reason
 
 TOOLS = ("Bash", "Read", "Write", "Edit")
 REQUEST = {
@@ -77,3 +80,10 @@ def test_benign_calls_pass(tool, inp):
 def test_disabled_lets_self_targeting_calls_through():
     result = review("Bash", {"command": "safeagents stop 1"}, Config(scanner=None, self_protection=False))
     assert result.verdict == "passed"
+
+
+def test_json_escapes_do_not_hide_an_attack():
+    # The tool decodes `\\u0073` to `s`; the raw text would not match.
+    escaped = json.dumps({"command": "safeagents stop 1"}).replace("safeagents", "\\u0073afeagents")
+    assert json.loads(escaped)["command"] == "safeagents stop 1"
+    assert self_protection_reason("bash", escaped) == "self-protection: starts or stops the safeagents proxy"

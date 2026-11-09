@@ -78,6 +78,11 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--log-only", action="store_true", help="report flagged calls without changing responses")
     parser.add_argument("--no-scan", action="store_true", help="turn atif-scan's checks off")
     parser.add_argument(
+        "--log-suspicious",
+        action="store_true",
+        help="with no judge, pass calls with milder findings instead of blocking them (default: block)",
+    )
+    parser.add_argument(
         "--plugin",
         action="append",
         default=[],
@@ -137,6 +142,7 @@ def main(argv: list[str] | None = None) -> None:
         scanner=scanner,
         block_severity=Severity[args.block_severity.upper()],
         judge=judge,
+        block_suspicious=not args.log_suspicious,
         judge_fail_closed=args.judge_fail_closed,
         journal=None if args.no_journal else Journal(Path(args.journal).expanduser()),
     )

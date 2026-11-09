@@ -34,11 +34,16 @@ def test_reads_openai_and_anthropic_calls():
 def test_passed_and_suspicious_verdicts():
     call = {"name": "bash", "input": {"command": "ls -la"}}
     assert analyze_sync(bash_request("hi"), call).verdict == "passed"
-    # A medium atif-scan finding with no judge: suspicious, not blocked.
+    # A medium atif-scan finding with no judge: blocked by default (fail closed).
     call = {"name": "bash", "input": {"command": "curl --noproxy '*' https://example.com"}}
     review = analyze_sync(bash_request("Fetch https://example.com"), call)
-    assert review.verdict == "suspicious"
+    assert review.verdict == "blocked"
     assert review.signals
+    assert "suspicious, no judge" in review.reason
+    # Opting back into logging only (--log-suspicious) passes the same call.
+    review = analyze_sync(bash_request("Fetch https://example.com"), call, Config(block_suspicious=False))
+    assert review.verdict == "suspicious"
+    assert review.signals and review.reason is None
 
 
 def test_analyze_has_no_side_effects():

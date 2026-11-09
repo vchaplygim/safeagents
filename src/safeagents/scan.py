@@ -37,11 +37,32 @@ from .utils import content_text
 
 logger = logging.getLogger("safeagents")
 
+# A value is decoded at runtime and then connected to: `base64 -d`, `xxd -r`, a hex
+# `printf`, or a `| rev`, whose result is used as an obfuscated target (`http://$VAR`
+# or a `$(...)` host). This hides the host from the request-only host rule, so match it
+# here on the command channel. Both a decode step and an obfuscated target are required,
+# in either order, so decoding a plain download (`curl host | base64 -d`) does not trip it.
+_DECODE = (
+    r"(?:base64\s+(?:-d|--decode|-D)\b|base32\s+(?:-d|--decode)\b|\bxxd\s+-r\b|"
+    r"\|\s*rev\b|printf\s+[^|;&\n]*\\x[0-9a-fA-F]{2})"
+)
+_OBFUSCATED_TARGET = r"(?:https?://[^\s\"'|]*\$|\b(?:curl|wget|nc|ncat|telnet|ssh|scp)\b[^\n|]*\$\()"
+DECODE_THEN_CONNECT = rf"(?s)^(?=.*{_DECODE}).*?{_OBFUSCATED_TARGET}"
+
 # Behaviour from the Cohere report that atif-scan has no check for yet.
 EXTRA_DETECTORS = (
     RegexDetector(
         CheckSpec("safeagents.namespace_escape", Severity.MEDIUM, title="Creates or enters Linux namespaces"),
         r"\b(?:unshare|nsenter)\b",
+        frozenset({Channel.COMMAND}),
+    ),
+    RegexDetector(
+        CheckSpec(
+            "safeagents.decode_then_connect",
+            Severity.HIGH,
+            title="Decodes a value at runtime, then connects to it",
+        ),
+        DECODE_THEN_CONNECT,
         frozenset({Channel.COMMAND}),
     ),
 )

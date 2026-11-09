@@ -15,10 +15,17 @@
 
 from __future__ import annotations
 
-import json
 from collections.abc import Iterable
 
-from .constants import AUTHORITY_PATTERN, DEFAULT_ALLOWED_HOSTS, HOST_PATTERN, IPV4_PATTERN
+from .constants import (
+    AUTHORITY_PATTERN,
+    DEFAULT_ALLOWED_HOSTS,
+    FILE_WRITE_TOOL,
+    HOST_PATTERN,
+    IPV4_PATTERN,
+    UPLOAD_PATTERN,
+)
+from .utils import content_text
 
 
 def declared_tools(request: dict) -> set[str]:
@@ -49,31 +56,61 @@ def extract_hosts(text: str) -> list[str]:
     return sorted(hosts)
 
 
+def sourced_hosts(request: dict) -> set[str]:
+    """Hosts the human put in play: those named in the user, system and developer turns.
+
+    Assistant turns and tool results are excluded on purpose. A host the model wrote
+    earlier is no more sourced than one it writes now, and a host that only appears in
+    a tool's output can be laundered into one by a call that echoes it back.
+    """
+    hosts: set[str] = set()
+    hosts.update(extract_hosts(content_text(request.get("system"))))
+    for message in request.get("messages") or []:
+        if not isinstance(message, dict):
+            continue
+        if message.get("role") in ("user", "system", "developer"):
+            # content_text keeps only text/input_text blocks, so Anthropic tool_result
+            # blocks carried on a user message are dropped here.
+            hosts.update(extract_hosts(content_text(message.get("content"))))
+    return hosts
+
+
+def host_allowed(host: str, allowed: Iterable[str]) -> bool:
+    """`host` equals one of `allowed`, or is a subdomain of one."""
+    return any(host == entry or host.endswith("." + entry) for entry in allowed)
+
+
 class Policy:
     """What a request allows its response to call."""
 
-    def __init__(self, request: dict, allowed_hosts: Iterable[str] = DEFAULT_ALLOWED_HOSTS):
+    def __init__(
+        self,
+        request: dict,
+        allowed_hosts: Iterable[str] = DEFAULT_ALLOWED_HOSTS,
+        upload_hosts: Iterable[str] = (),
+    ):
         self.declared = declared_tools(request)
-        # The request without the model's own turns: a host the model wrote earlier
-        # is no more sourced than one it writes now.
-        context = dict(request)
-        if isinstance(context.get("messages"), list):
-            context["messages"] = [
-                message
-                for message in context["messages"]
-                if not (isinstance(message, dict) and message.get("role") == "assistant")
-            ]
-        self.context = json.dumps(context, ensure_ascii=False).lower()
+        self.sourced = sourced_hosts(request)
         self.allowed_hosts = [host.lower() for host in allowed_hosts]
+        # Hosts a call may send data to. The GET allowlist (package registries and the
+        # like) does not grant uploads, and merely naming a host in the chat does not
+        # authorise exfiltrating to it, so this list is separate and empty by default.
+        self.upload_hosts = [host.lower() for host in upload_hosts]
 
     def check(self, name: str, args: str) -> str | None:
         """Why a call to `name` with raw `args` should be blocked, if it should."""
         if name not in self.declared:
             return "undeclared tool"
+        # Writing a host into a file contacts nothing; the host rule is about reaching one.
+        if FILE_WRITE_TOOL.match(name):
+            return None
+        uploading = bool(UPLOAD_PATTERN.search(args))
         for host in extract_hosts(args):
-            if host in self.context:
-                continue
-            if any(host == allowed or host.endswith("." + allowed) for allowed in self.allowed_hosts):
+            if uploading:
+                if host_allowed(host, self.upload_hosts):
+                    continue
+                return f"host `{host}` receives uploaded data but is not an allowed upload target"
+            if host_allowed(host, self.sourced) or host_allowed(host, self.allowed_hosts):
                 continue
             return f"host `{host}` appears nowhere in the conversation"
         return None

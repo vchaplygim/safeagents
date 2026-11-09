@@ -17,9 +17,9 @@ The proxy guards the agent's tool calls, but by default nothing stops the agent 
 turning the proxy off, putting it in log-only mode, deleting or editing the journal
 (the only record of a blocked call), redirecting the harness away from the proxy, or
 dropping an atif-scan allowance that excuses a detector. These checks run before the
-policy and scanner, on the request-only channels (the raw arguments), and are not
-excusable by a plugin allowance: an allowance only affects atif-scan findings, this
-runs earlier and independently.
+policy and scanner, on the arguments both raw and JSON-decoded, and are not excusable
+by a plugin allowance: an allowance only affects atif-scan findings, this runs earlier
+and independently.
 
 The checks are deliberately coarse. A guarded coding agent has no legitimate reason to
 touch the proxy's own control surface, so matching its name, state directory, the
@@ -41,6 +41,10 @@ _CLI_WEAKEN = re.compile(r"\bsafeagents\b.*?--(?:log-only|no-journal|no-scan|no-
 _PROCESS_KILL = re.compile(
     r"\b(?:pkill|killall|kill)\b[^\"]*safeagents|safeagents[^\"]*\b(?:pkill|killall)\b", re.IGNORECASE
 )
+# Reading the proxy process's environment or memory (`/proc/$(pgrep -f safeagents)/environ`),
+# which holds `SAFEAGENTS_JUDGE_API_KEY` and whatever the shell that started it exported.
+# atif-scan does not flag it: its harness-secret check is about the agent's own process.
+_PROCESS_ENV = re.compile(r"(?s)(?=.*\bsafeagents\b).*/proc/[^\n\"']{0,120}?/(?:environ|mem)\b")
 # The proxy's own state directory and journal (run locks, descriptors, calls.jsonl).
 _STATE_DIR = re.compile(r"[~/.\w]*\.safeagents\b", re.IGNORECASE)
 # Redirecting the harness away from the proxy by setting its base-URL environment variable.
@@ -61,6 +65,7 @@ _RULES = (
     (_CLI_CONTROL.search, "starts or stops the safeagents proxy"),
     (_CLI_WEAKEN.search, "restarts the safeagents proxy with its checks weakened"),
     (_PROCESS_KILL.search, "kills the safeagents proxy process"),
+    (_PROCESS_ENV.search, "reads the safeagents proxy's process environment"),
     (_STATE_DIR.search, "touches the safeagents state directory or journal"),
     (_BASE_URL_ENV.search, "redirects the harness base URL away from the proxy"),
 )

@@ -22,6 +22,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 from collections.abc import Sequence
 from dataclasses import dataclass, field
@@ -99,9 +100,14 @@ class Guard:
     async def review(self, name: str, args: str) -> Review:
         """Reviews a complete call without blocking, logging or recording it."""
         self._calls.append((name, args))
-        policy_reason = self.policy.check(name, args)
-        if policy_reason is not None:
-            return Review(policy_reason)
+        # The request-only checks match text, but the tool runs the *decoded* arguments:
+        # `https://evil` reaches evil.example.com while its raw text holds no `://`.
+        # Check the decoded form as well as the raw one (the raw text still holds every
+        # value if a key is repeated, where a JSON parser keeps only the last).
+        for text in dict.fromkeys((args, decoded_arguments(args))):
+            policy_reason = self.policy.check(name, text)
+            if policy_reason is not None:
+                return Review(policy_reason)
         return await self._scan(name, args)
 
     async def allow(self, name: str, args: str) -> bool:
@@ -169,6 +175,15 @@ class Guard:
         if block:
             return Review(f"{findings}; judge: {why}", signals, f"block: {why}")
         return Review(None, signals, f"allow: {why}")
+
+
+def decoded_arguments(args: str) -> str:
+    """Raw JSON arguments re-serialized from their parsed value, so `\\uXXXX` escapes are
+    decoded as the tool will see them; the raw text if it is not JSON."""
+    try:
+        return compact_json(json.loads(args))
+    except ValueError:
+        return args
 
 
 def call_parts(tool_call: dict) -> tuple[str, str]:

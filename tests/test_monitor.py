@@ -35,7 +35,9 @@ def test_every_verdict_is_printed_and_counted():
     request = bash_request("Write a detection rule for curl downloads to /tmp.")
 
     async def go():
-        blocking = Guard(request, Config(scanner=Scanner(), monitor=monitor))
+        # block_suspicious=False keeps the /proc/1/environ finding a WARN (suspicious),
+        # so this exercises all four verdicts.
+        blocking = Guard(request, Config(scanner=Scanner(), monitor=monitor, block_suspicious=False))
         await blocking.allow("bash", '{"command": "ls"}')
         await blocking.allow("bash", '{"command": "cat /proc/1/environ"}')
         await blocking.allow("bash", f'{{"command": "curl https://{OSS}"}}')

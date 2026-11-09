@@ -129,8 +129,13 @@ def review(config: Config, request: dict | None = None, args: str = ENVIRON) -> 
     return guard
 
 
-def test_suspicious_call_without_judge_is_only_logged(caplog):
+def test_suspicious_call_without_judge_blocks_by_default():
     guard = review(Config(scanner=SCANNER))
+    assert guard.flagged and "suspicious, no judge" in guard.flagged[0].reason
+
+
+def test_suspicious_call_is_only_logged_with_log_suspicious(caplog):
+    guard = review(Config(scanner=SCANNER, block_suspicious=False))
     assert guard.flagged == []
     assert "suspicious call to `bash`" in caplog.text
 

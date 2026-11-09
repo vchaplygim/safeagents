@@ -49,6 +49,9 @@ class Config:
     scanner: Scanner | None = field(default_factory=Scanner)
     block_severity: Severity = Severity.HIGH
     judge: Judge | None = None
+    # With no judge configured, block suspicious calls (atif-scan findings below
+    # block_severity) instead of only logging them. Set False to pass them.
+    block_suspicious: bool = True
     # Block suspicious calls when the judge can't be reached or gives no verdict.
     judge_fail_closed: bool = False
     # Shows reviewed calls in the terminal; without one, flagged calls are logged.
@@ -157,10 +160,13 @@ class Guard:
         return await self._judge(name, args, signals)
 
     async def _judge(self, name: str, args: str, signals: list[Signal]) -> Review:
+        findings = ", ".join(str(signal) for signal in signals)
         judge = self.config.judge
         if judge is None:
+            # No judge to decide: block by default (fail closed) unless told to pass.
+            if self.config.block_suspicious:
+                return Review(f"atif-scan: {findings}; suspicious, no judge", signals)
             return Review(None, signals)
-        findings = ", ".join(str(signal) for signal in signals)
         try:
             block, why = await judge.review(self.request, name, args, signals)
         except JudgeError as e:

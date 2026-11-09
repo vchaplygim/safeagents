@@ -19,32 +19,37 @@ from conftest import bash_request
 from safeagents import Config, Guard
 
 
-class SlowScanner:
-    """A stand-in for atif-scan: `signals` is synchronous and blocks (CPU-bound)."""
+class BusyScanner:
+    """A stand-in for atif-scan: `signals` is synchronous and CPU-bound (holds the GIL)."""
 
-    def __init__(self, delay: float) -> None:
-        self.delay = delay
+    def __init__(self, seconds: float) -> None:
+        self.seconds = seconds
 
     def signals(self, steps, calls):
-        time.sleep(self.delay)
+        deadline = time.perf_counter() + self.seconds
+        while time.perf_counter() < deadline:
+            pass
         return []
 
 
-def test_scan_does_not_stall_the_event_loop():
-    delay = 0.3
-    reviews = 4
+def test_a_cpu_bound_scan_does_not_freeze_the_event_loop():
+    scan_seconds = 0.4
 
-    async def one() -> bool:
-        guard = Guard(bash_request("hi"), Config(scanner=SlowScanner(delay)))
-        return await guard.allow("bash", '{"command": "ls"}')
+    async def go() -> tuple[bool, float]:
+        guard = Guard(bash_request("hi"), Config(scanner=BusyScanner(scan_seconds)))
+        review = asyncio.ensure_future(guard.allow("bash", '{"command": "ls"}'))
+        # Another request's work: a ticker that should keep running during the scan.
+        gaps, last = [], time.perf_counter()
+        while not review.done():
+            await asyncio.sleep(0.005)
+            now = time.perf_counter()
+            gaps.append(now - last)
+            last = now
+        return await review, max(gaps)
 
-    async def go() -> tuple[float, list[bool]]:
-        start = time.perf_counter()
-        results = await asyncio.gather(*[one() for _ in range(reviews)])
-        return time.perf_counter() - start, results
-
-    elapsed, results = asyncio.run(go())
-    assert all(results)  # no findings, so every call is allowed
-    # Run off the loop, the blocking scans overlap in worker threads; left on the loop
-    # they would serialise to reviews * delay. A generous bound keeps this non-flaky.
-    assert elapsed < reviews * delay * 0.6
+    allowed, worst_gap = asyncio.run(go())
+    assert allowed  # no findings
+    # On the loop, the ticker would stall for the whole scan. In a worker thread the
+    # interpreter hands the GIL back every switch interval (5 ms by default), so the
+    # loop keeps serving; it does not make the scan itself parallel.
+    assert worst_gap < scan_seconds / 4

@@ -75,6 +75,13 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument(
         "--allow-host", action="append", default=[], metavar="HOST", help="host calls may reach (repeatable)"
     )
+    parser.add_argument(
+        "--allow-upload-host",
+        action="append",
+        default=[],
+        metavar="HOST",
+        help="host calls may upload data to; reach allowlists do not grant uploads (repeatable)",
+    )
     parser.add_argument("--log-only", action="store_true", help="report flagged calls without changing responses")
     parser.add_argument("--no-scan", action="store_true", help="turn atif-scan's checks off")
     parser.add_argument(
@@ -134,6 +141,7 @@ def main(argv: list[str] | None = None) -> None:
     config = Config(
         block=not args.log_only,
         allowed_hosts=[*DEFAULT_ALLOWED_HOSTS, *args.allow_host],
+        upload_hosts=args.allow_upload_host,
         scanner=scanner,
         block_severity=Severity[args.block_severity.upper()],
         judge=judge,

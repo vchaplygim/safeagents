@@ -45,6 +45,9 @@ class Config:
     block: bool = True
     # Hosts tool calls may reach even if the conversation never mentions them.
     allowed_hosts: Sequence[str] = DEFAULT_ALLOWED_HOSTS
+    # Hosts tool calls may upload to. The reach allowlist above does not grant uploads,
+    # nor does merely naming a host in the chat, so exfiltration targets must be listed here.
+    upload_hosts: Sequence[str] = ()
     # None turns atif-scan off.
     scanner: Scanner | None = field(default_factory=Scanner)
     block_severity: Severity = Severity.HIGH
@@ -91,7 +94,7 @@ class Guard:
     def __init__(self, request: dict, config: Config) -> None:
         self.request = request
         self.config = config
-        self.policy = Policy(request, config.allowed_hosts)
+        self.policy = Policy(request, config.allowed_hosts, config.upload_hosts)
         self.flagged: list[Blocked] = []
         self._calls: list[tuple[str, str]] = []
         self._steps: list[dict] | None = None

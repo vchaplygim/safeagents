@@ -61,6 +61,35 @@ AUTHORITY_PATTERN = re.compile(r"://([^\s/?#\"'\\`)\]>]*)")
 HOST_PATTERN = re.compile(r"[a-z0-9.-]*")
 IPV4_PATTERN = re.compile(r"(?<![\d.])\d{1,3}(?:\.\d{1,3}){3}(?![\d.])")
 
+# A call *sends* data out, rather than merely *reaching* a host, when it carries an
+# outbound payload: a curl/wget body or file-upload flag, or scp/rsync to a remote.
+# The flag letters are case-sensitive on purpose (curl's `-d`/`-F`/`-T` differ from
+# `-D`/`-f`/`-t`), and each body flag must sit in the curl/wget command segment
+# (before the next `;`, `&&` or `|`) so an unrelated `-d` elsewhere is not an upload.
+# Loopback targets are never uploads in this sense: posting to a local dev server is
+# not exfiltration.
+_BODY_FLAG = (
+    r"(?:--data(?:-binary|-raw|-urlencode|-ascii)?\b|(?<!\S)-d[\s=]|(?<!\S)-F[\s=]|--form\b|"
+    r"(?<!\S)-T[\s=]|--upload-file\b|--post-data\b|--post-file\b|--body-data\b|--body-file\b)"
+)
+HTTP_UPLOAD_PATTERN = re.compile(rf"\b(?:curl|wget)\b[^;&|\n]*{_BODY_FLAG}")
+# Shell command separators: upload-vs-reach is decided per segment, so a POST to one
+# host does not turn a GET to another host in the same call into an upload.
+SEGMENT_SPLIT = re.compile(r"&&|\|\||[;|\n]")
+# scp/rsync: a remote `[user@]host:path` operand. Only the destination (last operand)
+# makes the copy an upload; a remote source is a download. `scheme://` is not a remote
+# spec, and two letters minimum keeps a Windows drive (`C:`) out.
+COPY_TOOL_PATTERN = re.compile(r"(?<![\w-])(?:scp|rsync)(?![\w-])")
+REMOTE_SPEC_PATTERN = re.compile(r"^(?:[\w.+-]+@)?(?P<host>[A-Za-z0-9.-]{2,}):(?!//)")
+
+# Tools that write to disk reach no host: a URL in their arguments (a config example,
+# a docstring) is content, not a target the call contacts. Matched by exact name so a
+# reaching tool cannot earn the exemption by having "edit" in its name.
+FILE_WRITE_TOOL = re.compile(
+    r"(?i)^(?:write|edit|multi_?edit|notebook_?edit|create_?file|write_?file|save_?file|"
+    r"append_?file|str_?replace(?:_\w+)?|apply_?patch|fs_?write|fs_?append)$"
+)
+
 # --- Judge ---
 
 DEFAULT_JUDGE_MODEL = "judge"

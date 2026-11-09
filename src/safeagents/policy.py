@@ -15,15 +15,20 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterable
+import ipaddress
+import json
+from collections.abc import Iterable, Iterator
 
 from .constants import (
     AUTHORITY_PATTERN,
+    COPY_TOOL_PATTERN,
     DEFAULT_ALLOWED_HOSTS,
     FILE_WRITE_TOOL,
     HOST_PATTERN,
+    HTTP_UPLOAD_PATTERN,
     IPV4_PATTERN,
-    UPLOAD_PATTERN,
+    REMOTE_SPEC_PATTERN,
+    SEGMENT_SPLIT,
 )
 from .utils import content_text
 
@@ -80,6 +85,55 @@ def host_allowed(host: str, allowed: Iterable[str]) -> bool:
     return any(host == entry or host.endswith("." + entry) for entry in allowed)
 
 
+def is_loopback(host: str) -> bool:
+    """`localhost`, a `.localhost` name, or a loopback/unspecified IP literal."""
+    if host == "localhost" or host.endswith(".localhost"):
+        return True
+    try:
+        address = ipaddress.ip_address(host)
+    except ValueError:
+        return False
+    return address.is_loopback or address.is_unspecified
+
+
+def argument_texts(args: str) -> list[str]:
+    """The string values in a call's JSON arguments (the raw text if it isn't JSON)."""
+    try:
+        parsed = json.loads(args)
+    except ValueError:
+        return [args]
+
+    def strings(value: object) -> Iterator[str]:
+        if isinstance(value, str):
+            yield value
+        elif isinstance(value, dict):
+            for item in value.values():
+                yield from strings(item)
+        elif isinstance(value, list):
+            for item in value:
+                yield from strings(item)
+
+    return list(strings(parsed))
+
+
+def segment_targets(segment: str) -> tuple[list[str], list[str]]:
+    """The hosts one shell segment reaches and the hosts it uploads to."""
+    hosts = extract_hosts(segment)
+    if HTTP_UPLOAD_PATTERN.search(segment):
+        return [], hosts
+    copy = COPY_TOOL_PATTERN.search(segment)
+    if copy is None:
+        return hosts, []
+    operands = [token.strip("\"'") for token in segment[copy.end() :].split() if not token.startswith("-")]
+    reached, uploaded = list(hosts), []
+    for index, operand in enumerate(operands):
+        remote = REMOTE_SPEC_PATTERN.match(operand)
+        if remote is not None:
+            # The last operand is the destination: a remote one makes this an upload.
+            (uploaded if index == len(operands) - 1 else reached).append(remote.group("host").lower())
+    return reached, uploaded
+
+
 class Policy:
     """What a request allows its response to call."""
 
@@ -104,12 +158,18 @@ class Policy:
         # Writing a host into a file contacts nothing; the host rule is about reaching one.
         if FILE_WRITE_TOOL.match(name):
             return None
-        uploading = bool(UPLOAD_PATTERN.search(args))
-        for host in extract_hosts(args):
-            if uploading:
-                if host_allowed(host, self.upload_hosts):
-                    continue
-                return f"host `{host}` receives uploaded data but is not an allowed upload target"
+        reached: list[str] = []
+        uploaded: list[str] = []
+        for text in argument_texts(args):
+            for segment in SEGMENT_SPLIT.split(text):
+                segment_reached, segment_uploaded = segment_targets(segment)
+                reached += segment_reached
+                uploaded += segment_uploaded
+        for host in uploaded:
+            if is_loopback(host) or host_allowed(host, self.upload_hosts):
+                continue
+            return f"host `{host}` receives uploaded data but is not an allowed upload target"
+        for host in reached:
             if host_allowed(host, self.sourced) or host_allowed(host, self.allowed_hosts):
                 continue
             return f"host `{host}` appears nowhere in the conversation"

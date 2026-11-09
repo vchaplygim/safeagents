@@ -52,3 +52,23 @@ def test_concurrent_processes_assign_unique_ids(tmp_path):
     ids = sorted(entry["id"] for entry in read(path))
     # Every append got a distinct id and the range is contiguous: no collisions, no gaps.
     assert ids == list(range(1, workers * per_worker + 1))
+
+
+def test_a_torn_last_line_does_not_swallow_the_next_entry(tmp_path):
+    path = tmp_path / "calls.jsonl"
+    journal = Journal(path)
+    assert journal.append(verdict="blocked") == 1
+    with open(path, "a", encoding="utf-8") as file:
+        file.write('{"id": 2, "verdict": "blo')  # a writer died mid-line
+    assert journal.append(verdict="blocked") == 2
+    assert journal.append(verdict="blocked") == 3
+    assert [entry["id"] for entry in read(path)] == [1, 2, 3]
+
+
+def test_a_rotated_journal_is_read_again(tmp_path):
+    path = tmp_path / "calls.jsonl"
+    journal = Journal(path)
+    for _ in range(3):
+        journal.append(verdict="blocked")
+    path.write_text('{"id": 7, "verdict": "blocked"}\n', encoding="utf-8")  # rotated by hand
+    assert journal.append(verdict="blocked") == 8

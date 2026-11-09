@@ -84,16 +84,52 @@ class Journal:
 
     def __init__(self, path: Path = DEFAULT_JOURNAL_PATH) -> None:
         self.path = Path(path)
+        # How far into the file this process has read, and the largest id seen there.
+        # Ids are still taken from the file under the lock (another proxy may have
+        # appended since), but only the bytes added since the last append are read.
+        self._offset = 0
+        self._max_id = 0
+
+    def _catch_up(self) -> None:
+        """Reads the lines appended since the last call; the whole file if it shrank."""
+        try:
+            size = self.path.stat().st_size
+        except FileNotFoundError:
+            size = 0
+        if size < self._offset:  # truncated or rotated: start over
+            self._offset = self._max_id = 0
+        if size == self._offset:
+            return
+        with open(self.path, "rb") as file:
+            file.seek(self._offset)
+            data = file.read(size - self._offset)
+        complete = data.rfind(b"\n") + 1  # a torn last line is read again next time
+        for raw in data[:complete].splitlines():
+            try:
+                entry = json.loads(raw)
+            except ValueError:
+                continue
+            if isinstance(entry, dict) and isinstance(entry.get("id"), int):
+                self._max_id = max(self._max_id, entry["id"])
+        self._offset += complete
 
     def append(self, **entry: object) -> int:
         self.path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-        # The next id is read from the file under the lock, not cached in memory: a cached
-        # counter goes stale the moment another process (or Journal) appends to the same file.
+        # The next id is taken from the file under the lock, not from a counter that
+        # goes stale the moment another process (or Journal) appends to the same file.
         with _locked(self.path):
-            existing_ids = [existing["id"] for existing in read(self.path)]
-            call_id = max(existing_ids, default=0) + 1
+            self._catch_up()
+            call_id = self._max_id + 1
             line = json.dumps({"id": call_id, "time": time.time(), **entry}, ensure_ascii=False)
-            file_descriptor = os.open(self.path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
-            with os.fdopen(file_descriptor, "a", encoding="utf-8") as file:
-                file.write(line + "\n")
+            file_descriptor = os.open(self.path, os.O_RDWR | os.O_CREAT | os.O_APPEND, 0o600)
+            with os.fdopen(file_descriptor, "a+b") as file:
+                # A writer that died mid-line leaves no newline; end its line first, or
+                # this entry would merge into it, fail to parse, and its id be reused.
+                end = file.seek(0, os.SEEK_END)
+                if end:
+                    file.seek(end - 1)
+                    if file.read(1) != b"\n":
+                        file.write(b"\n")  # O_APPEND: lands at the end whatever the position
+                file.write((line + "\n").encode("utf-8"))
+            self._max_id = call_id
         return call_id

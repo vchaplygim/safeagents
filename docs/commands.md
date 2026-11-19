@@ -16,6 +16,7 @@
 | --- | --- |
 | `--log-only` | report flagged calls without changing responses |
 | `--allow-host HOST` | extra host calls may reach, subdomains included (repeatable) |
+| `--allow-upload-host HOST` | host calls may send data to (`curl -d/-F/-T`, `wget --post-*`, `scp`/`rsync` to a remote), subdomains included (repeatable). Neither `--allow-host` nor a mention in the conversation allows uploads; loopback always does |
 | `--no-scan` | request-only checks, no atif-scan |
 | `--no-self-protection` | let calls stop or kill the proxy, touch `~/.safeagents`, read its process environment, redirect the harness's base URL or write an atif-scan allowance (blocked by default) |
 | `--block-severity` | `low`, `medium`, `high` or `critical`: findings at or above it block without asking the judge |

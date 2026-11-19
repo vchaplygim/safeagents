@@ -15,17 +15,23 @@
 
 from __future__ import annotations
 
+import ipaddress
 import json
 from collections.abc import Iterable
 
 from .constants import (
     AUTHORITY_PATTERN,
+    COPY_TOOL_PATTERN,
+    CURL_UPLOAD_PATTERN,
     DEFAULT_ALLOWED_HOSTS,
     HOST_PATTERN,
     IPV4_PATTERN,
     NETWORK_PATTERN,
     NETWORK_TOOL_PATTERN,
+    REMOTE_SPEC_PATTERN,
     RESERVED_HOSTS,
+    SEGMENT_SPLIT,
+    WGET_UPLOAD_PATTERN,
 )
 
 
@@ -81,10 +87,51 @@ def call_text(args: str) -> str:
     return "\n".join(strings)
 
 
+def host_allowed(host: str, allowed: Iterable[str]) -> bool:
+    """`host` equals one of `allowed`, or is a subdomain of one."""
+    return any(host == entry or host.endswith("." + entry) for entry in allowed)
+
+
+def is_loopback(host: str) -> bool:
+    """`localhost`, a `.localhost` name, or a loopback/unspecified IP literal."""
+    if host == "localhost" or host.endswith(".localhost"):
+        return True
+    try:
+        address = ipaddress.ip_address(host)
+    except ValueError:
+        return False
+    return address.is_loopback or address.is_unspecified
+
+
+def segment_targets(segment: str) -> tuple[list[str], list[str]]:
+    """The scp/rsync remotes one shell segment reaches, and the hosts it uploads to.
+
+    URL hosts a segment merely reaches are left to the host rule; this adds what it cannot
+    see (`user@host:path` remotes) and what it does not tell apart (a request with a body)."""
+    if CURL_UPLOAD_PATTERN.search(segment) or WGET_UPLOAD_PATTERN.search(segment):
+        return [], extract_hosts(segment)
+    copy = COPY_TOOL_PATTERN.search(segment)
+    if copy is None:
+        return [], []
+    operands = [token.strip("\"'") for token in segment[copy.end() :].split() if not token.startswith("-")]
+    reached, uploaded = [], []
+    for index, operand in enumerate(operands):
+        remote = REMOTE_SPEC_PATTERN.match(operand)
+        if remote is not None:
+            # The last operand is the destination: a remote one makes this an upload.
+            (uploaded if index == len(operands) - 1 else reached).append(remote.group("host").lower())
+    return reached, uploaded
+
+
 class Policy:
     """What a request allows its response to call."""
 
-    def __init__(self, request: dict, allowed_hosts: Iterable[str] = DEFAULT_ALLOWED_HOSTS):
+    def __init__(
+        self,
+        request: dict,
+        allowed_hosts: Iterable[str] = DEFAULT_ALLOWED_HOSTS,
+        upload_hosts: Iterable[str] = (),
+    ):
         self.declared = declared_tools(request)
         # The request without the model's own turns: a host the model wrote earlier
         # is no more sourced than one it writes now.
@@ -97,6 +144,9 @@ class Policy:
             ]
         self.context = json.dumps(context, ensure_ascii=False).lower()
         self.allowed_hosts = [host.lower() for host in (*allowed_hosts, *RESERVED_HOSTS)]
+        # Hosts a call may send data to. Being allowed to reach a host, or seeing it named in the conversation, does
+        # not allow sending data there, so this list is separate and empty by default.
+        self.upload_hosts = [host.lower() for host in upload_hosts]
 
     def check(self, name: str, args: str) -> str | None:
         """Why a call to `name` with raw `args` should be blocked, if it should."""
@@ -107,16 +157,28 @@ class Policy:
         network_tool = NETWORK_TOOL_PATTERN.search(name)
         if not (network_tool or NETWORK_PATTERN.search(text)):
             return None
+        # Sending data is judged per shell segment, so a POST to a local server does not turn a GET elsewhere in the
+        # same command into an upload.
+        remotes: set[str] = set()
+        uploaded: set[str] = set()
+        for segment in SEGMENT_SPLIT.split(text):
+            segment_reached, segment_uploaded = segment_targets(segment)
+            remotes.update(segment_reached)
+            uploaded.update(segment_uploaded)
+        for host in sorted(uploaded):
+            if not (is_loopback(host) or host_allowed(host, self.upload_hosts)):
+                return f"host `{host}` receives uploaded data but is not an allowed upload target"
         # A URL's host counts anywhere in such a call (code often names the URL a line before it opens it). A bare IP
         # counts only on a line that reaches out: elsewhere it is data, like the log lines of a test fixture.
         reaching = (
             text if network_tool else "\n".join(line for line in text.splitlines() if NETWORK_PATTERN.search(line))
         )
         url_hosts = [host for host in extract_hosts(text) if not IPV4_PATTERN.fullmatch(host)]
-        for host in sorted({*url_hosts, *extract_hosts(reaching)}):
+        # A host cleared for uploads can be reached too: sending data there means connecting to it.
+        for host in sorted({*url_hosts, *extract_hosts(reaching), *remotes} - uploaded):
             if host in self.context:
                 continue
-            if any(host == allowed or host.endswith("." + allowed) for allowed in self.allowed_hosts):
+            if host_allowed(host, self.allowed_hosts):
                 continue
             return f"host `{host}` appears nowhere in the conversation"
         return None

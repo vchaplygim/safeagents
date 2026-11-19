@@ -2,6 +2,8 @@
 
 A lightweight local proxy between your agent and its model server. It checks every tool call the model makes before the harness sees it, and swaps the calls it blocks for a text notice, so the harness runs nothing. It works with any harness that lets you set a base URL (Claude Code, Pi, Hermes, OpenCode, ...), over OpenAI Chat Completions or Anthropic Messages, streaming or not.
 
+You want to plug a decision model in the loop? Pick one of the decision model from [safeagents judge bench leaderboard](https://huggingface.co/datasets/harness-hub/safeagents-judge-bench).
+
 ## Quickstart
 
 On macOS, Linux or WSL:
@@ -42,9 +44,11 @@ stopped 1  http://127.0.0.1:8787 -> https://api.anthropic.com
 
 Each tool call goes through three stages:
 
-1. **Request-only checks.** A call is blocked if it uses a tool the request never declared, or if its arguments contain a host (URL or bare IP) that appears nowhere in what the user or system wrote. The model's own turns and tool results don't count. Sending data (a request body, an upload, `scp`/`rsync` to a remote) needs more: the host must be allowed with `--allow-upload-host`, or be loopback. Hosts in files written with `Write`/`Edit` are not checked.
-2. **[atif-scan](https://github.com/huggingface/atif-scan) checks.** The conversation becomes an ATIF trace, so atif-scan's detectors run on the pending call: reading `/proc/1/environ`, `curl --noproxy`, a Kubernetes service-account token, `unshare`/`nsenter`, ... Findings at or above `--block-severity` (default `high`) are blocked, milder ones make the call suspicious.
-3. **Decision model** (optional). Suspicious calls go to a judge model, which answers `allow` or `block`. Without a judge, they are only logged.
+1. **Request-only checks.** A call is blocked if it uses a tool the request never declared, or if its arguments contain a host (URL or bare IP) that appears nowhere in the conversation. The model's own earlier turns don't count. Sending data (a curl/wget request body or upload, `scp`/`rsync` to a remote) needs more: the host must be allowed with `--allow-upload-host`, or be loopback. Calls against the proxy itself (stopping or killing it, editing `~/.safeagents`, redirecting the harness's base URL) are blocked too.
+2. **[atif-scan](https://github.com/huggingface/atif-scan) checks.** The conversation becomes an ATIF trace, so atif-scan's detectors run on the pending call: reading `/proc/1/environ`, `curl --noproxy`, a Kubernetes service-account token, `unshare`/`nsenter`, ... Findings at or above `--block-severity` (default `high`) are blocked, milder ones make the call suspicious. The examples above are all `medium`, so with the defaults they make a call suspicious, not blocked.
+3. **Decision model** (optional). Suspicious calls go to a judge model, which answers `allow` or `block`.
+
+**Without a judge, stage 2 blocks only at `high` and above.** A suspicious call passes unchanged and the agent sees nothing. It shows up only as a `WARN` line in the monitor or proxy log and in the journal (`~/.safeagents/calls.jsonl`, see [Watching the calls](#watching-the-calls)). For example, `cat /proc/1/environ` is a `medium` finding and runs in the default configuration. To stop such calls, configure a judge or lower `--block-severity` to `medium`.
 
 The judge only sees what the user wrote, the tool call and the findings, never the agent's reasoning or tool results, since an agent that wants a call to run would argue its case there. It can add blocks but never lift one, and clean calls never reach it.
 
@@ -52,7 +56,7 @@ Streaming adds no latency: each tool call is held until its arguments are comple
 
 ## Plugins
 
-`--plugin MODULE:FACTORY` (or `path/to/file.py:FACTORY`) adds your own [atif-scan](https://github.com/huggingface/atif-scan) checks, with the same convention as atif-scan's `--plugin`: `FACTORY()` returns a list of detectors, rules and allowances. Detectors and rules at or above `--block-severity` block, like the built-in ones. An allowance excuses the findings of the checks it covers, for a task that legitimately does what a check flags. `--allow-host` adds hosts calls may reach.
+`--plugin MODULE:FACTORY` (or `path/to/file.py:FACTORY`, or `hf://OWNER/REPO` for a plugin on the Hub, below) adds your own [atif-scan](https://github.com/huggingface/atif-scan) checks, with the same convention as atif-scan's `--plugin`: `FACTORY()` returns a list of detectors, rules and allowances. Detectors and rules at or above `--block-severity` block, like the built-in ones. An allowance excuses the findings of the checks it covers, for a task that legitimately does what a check flags. `--allow-host` adds hosts calls may reach.
 
 ```python
 # my_pack.py
@@ -81,6 +85,31 @@ PYTHONPATH=. safeagents start http://localhost:8000 --plugin my_pack:checks --al
 ```
 
 From Python, pass them to the scanner: `Config(scanner=Scanner(load_plugin("my_pack:checks")))`.
+
+### Plugins on the Hugging Face Hub
+
+A plugin can live in a Hub repo as a single Python file, and be loaded by name:
+
+```
+safeagents start http://localhost:8000 --plugin hf://harness-hub/qwen-safeagents-plugin
+```
+
+The full form is `hf://[TYPE/]OWNER/REPO[@REV][/FILE][:FACTORY]`:
+
+- `TYPE`: `datasets/` or `spaces/` for those repos; a model repo when left out.
+- `@REV`: a branch, tag or commit.
+- `/FILE`: the file in the repo; by default the only `.py` file at the repo's root.
+- `:FACTORY`: `checks` by default.
+
+The file is downloaded once and cached by `huggingface_hub`, so it also loads offline (`HF_HUB_OFFLINE=1`); a private repo needs a token (`hf auth login` or `HF_TOKEN`). The plugin runs as code in the proxy's process, so load plugins only from repos you trust, and pin a commit (`hf://harness-hub/qwen-safeagents-plugin@<commit>`) for reproducible runs.
+
+#### Community plugins
+
+Plugins shared on the Hub are gathered in the [safeagents plugins collection](https://huggingface.co/collections/harness-hub/safeagents-plugins). For example, [`harness-hub/safeagents-dotenv-plugin`](https://huggingface.co/harness-hub/safeagents-dotenv-plugin) blocks commands that send a `.env` file or a credential over the network:
+
+```
+safeagents start http://localhost:8000 --plugin hf://harness-hub/safeagents-dotenv-plugin
+```
 
 ## Publishing trajectories
 
@@ -115,7 +144,7 @@ JSON stays valid JSON (keys are redacted too), and files with nothing to redact 
 
 ## Benchmark
 
-[safeagents-judge-bench](https://huggingface.co/datasets/harness-hub/safeagents-judge-bench) scores decision models on 562 real agent tool calls that the scanner flags, each labelled `allow` or `block` with a kind of misuse (reward hacking, harness introspection, credential misuse, ...). Use its leaderboard to pick a `--judge-model`.
+[safeagents-judge-bench](https://huggingface.co/datasets/harness-hub/safeagents-judge-bench) scores decision models on 661 real agent tool calls that the scanner flags (v2; v1's 562 calls stay available as the `v1` revision), each labelled `allow` or `block` with a kind of misuse (reward hacking, harness introspection, credential misuse, ...). v2 adds runs with programmatic tool calling, where the agent writes a script that calls tools as functions. Use its leaderboard to pick a `--judge-model`.
 
 ## Watching the calls
 
@@ -142,6 +171,8 @@ Run in the foreground (`safeagents URL`) and the terminal shows a live histogram
 `WARN` calls ran but raised a finding; `FLAG` ones would have been blocked without `--log-only`. A background proxy writes the same calls to its log, one line each.
 
 Blocked, flagged and suspicious calls are also kept in `~/.safeagents/calls.jsonl` (readable by you only, since arguments can hold secrets). The format is in [docs/journal.md](docs/journal.md).
+
+An optional [`--sink MODULE:FACTORY`](docs/sink.md) sends those observations to a trusted callback off the response path, including with `--no-journal`. Sinks receive raw arguments and task text; enable them only for code you trust.
 
 ```
 $ safeagents inspect 3
@@ -179,6 +210,7 @@ As stated previously, this work is based on [`atif-scan`](https://github.com/hug
 - [`CASA`](https://github.com/outshift-open/outshift-casa)
 - [`Hybrid Inspection and Task-Based Access Control in Zero-Trust Agentic AI`](https://arxiv.org/pdf/2605.02682)
 - [`Delegated Authorization for Agents Constrained to Semantic Task-to-Scope Matching`](https://arxiv.org/abs/2510.26702)
+- [`Agentmetry`](https://github.com/blitzcrieg1/agentmetry): Agentmetry records the tool calls agents report through their hooks in a tamper-evident trail and forwards to a SIEM, so the two tools cover different layers.
 
 If you believe that your work should be cited or integrated in this repository, feel free to directly open an issue on GitHub. 
 

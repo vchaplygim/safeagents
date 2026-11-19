@@ -18,11 +18,13 @@
 | `--allow-host HOST` | extra host calls may reach, subdomains included (repeatable) |
 | `--allow-upload-host HOST` | host calls may send data to (`curl -d/-F/-T`, `wget --post-*`, `scp`/`rsync` to a remote), subdomains included (repeatable). Neither `--allow-host` nor a mention in the conversation allows uploads; loopback always does |
 | `--no-scan` | request-only checks, no atif-scan |
+| `--no-self-protection` | let calls stop or kill the proxy, touch `~/.safeagents`, read its process environment, redirect the harness's base URL or write an atif-scan allowance (blocked by default) |
 | `--block-severity` | `low`, `medium`, `high` or `critical`: findings at or above it block without asking the judge |
 | `--judge-url`, `--judge-model` | the decision model; its API key comes from `SAFEAGENTS_JUDGE_API_KEY` |
 | `--judge-fail-closed` | block suspicious calls when the judge errors or gives no verdict (default: allow and log) |
 | `--journal PATH` | where flagged calls are kept (default `~/.safeagents/calls.jsonl`, format in [journal.md](journal.md)) |
-| `--no-journal` | keep no record of them |
+| `--no-journal` | disable the local journal; explicitly configured sinks still receive observations |
+| `--sink MODULE:FACTORY` | trusted callback for non-passed observations, including raw arguments and task; repeatable (see [sink.md](sink.md)) |
 
 The built-in host allowlist covers loopback, GitHub, PyPI, Hugging Face, npm and crates.io.
 

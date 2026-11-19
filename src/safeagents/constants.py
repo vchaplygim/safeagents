@@ -57,38 +57,46 @@ DEFAULT_ALLOWED_HOSTS = (
     "crates.io",
 )
 
+# Domains reserved for examples (RFC 2606), allowed on top of any allowlist: no one can register them, so a call
+# reaches no one through them. Generated data and test fixtures use them all the time.
+RESERVED_HOSTS = ("example.com", "example.net", "example.org")
+
+# What lets a call reach a host: a network client in a command or in code, or a tool that fetches. A URL anywhere else
+# (a CSV row, a log line in a test fixture, a docstring citation) is data the call writes, not a request it makes.
+NETWORK_PATTERN = re.compile(
+    r"\b(?:curl|wget|nc|ncat|netcat|telnet|ssh|scp|sftp|rsync|ftp)\s"
+    r"|\bgit\s+(?:clone|fetch|pull|push|ls-remote)\b|\bpip3?\s+install\b|/dev/(?:tcp|udp)/"
+    r"|\brequests\.(?:get|post|put|patch|delete|head|options|request|Session)\b|\burlopen\(|\burllib\.request\b"
+    r"|\bhttpx\.|\baiohttp\.|\bhttp\.client\b|\bsocket\.(?:socket|create_connection)\b|\bfetch\(",
+    re.IGNORECASE,
+)
+# Tools that reach a URL by themselves (`web_fetch`, `browser_exec`, ...), whatever their arguments say.
+NETWORK_TOOL_PATTERN = re.compile(r"fetch|browse|browser|web|http|url|download", re.IGNORECASE)
+
 AUTHORITY_PATTERN = re.compile(r"://([^\s/?#\"'\\`)\]>]*)")
 HOST_PATTERN = re.compile(r"[a-z0-9.-]*")
-IPV4_PATTERN = re.compile(r"(?<![\d.])\d{1,3}(?:\.\d{1,3}){3}(?![\d.])")
+# Not after `=`: `pkg==0.5.1.4` is a version, not an address
+IPV4_PATTERN = re.compile(r"(?<![\d.=])\d{1,3}(?:\.\d{1,3}){3}(?![\d.])")
 
-# A call *sends* data out, rather than merely *reaching* a host, when it carries an
-# outbound payload: a curl/wget body or file-upload flag, or scp/rsync to a remote.
-# The flag letters are case-sensitive on purpose (curl's `-d`/`-F`/`-T` differ from
-# `-D`/`-f`/`-t`), and each body flag must sit in the curl/wget command segment
-# (before the next `;`, `&&` or `|`) so an unrelated `-d` elsewhere is not an upload.
-# Loopback targets are never uploads in this sense: posting to a local dev server is
-# not exfiltration.
-_BODY_FLAG = (
-    r"(?:--data(?:-binary|-raw|-urlencode|-ascii)?\b|(?<!\S)-d[\s=]|(?<!\S)-F[\s=]|--form\b|"
-    r"(?<!\S)-T[\s=]|--upload-file\b|--post-data\b|--post-file\b|--body-data\b|--body-file\b)"
+# A call *sends* data out, rather than merely *reaching* a host, when it carries an outbound payload: a curl/wget
+# body or upload flag, or scp/rsync to a remote. Each flag must sit in the same command segment as its client
+# (before the next `;`, `&&` or `|`), so an unrelated `-d` elsewhere is not an upload.
+# curl's short flags are case-sensitive and can be bundled (`-sSd@.env`). A body flag counts only when the letters
+# before it take no argument, so the `d` in `-odump.txt` is a file name, not `-d`.
+_CURL_BODY_FLAG = (
+    r"(?:(?<!\S)-[0-9#:aBfgGiIjJklLMnNOpqRsSvVZ]*[dFT]"
+    r"|(?<!\S)--(?:data(?:-binary|-raw|-urlencode|-ascii)?|json|form(?:-string)?|upload-file)(?![\w-]))"
 )
-HTTP_UPLOAD_PATTERN = re.compile(rf"\b(?:curl|wget)\b[^;&|\n]*{_BODY_FLAG}")
-# Shell command separators: upload-vs-reach is decided per segment, so a POST to one
-# host does not turn a GET to another host in the same call into an upload.
+CURL_UPLOAD_PATTERN = re.compile(rf"\bcurl\b[^;&|\n]*{_CURL_BODY_FLAG}")
+# wget only sends data through long options: its `-d`, `-F` and `-T` are debug, force-html and timeout.
+WGET_UPLOAD_PATTERN = re.compile(r"\bwget\b[^;&|\n]*(?<!\S)--(?:post|body)-(?:data|file)(?![\w-])")
+# Shell command separators.
 SEGMENT_SPLIT = re.compile(r"&&|\|\||[;|\n]")
-# scp/rsync: a remote `[user@]host:path` operand. Only the destination (last operand)
-# makes the copy an upload; a remote source is a download. `scheme://` is not a remote
-# spec, and two letters minimum keeps a Windows drive (`C:`) out.
+# scp/rsync: a remote `[user@]host:path` operand. Only the destination (last operand) makes the copy an upload; a
+# remote source is a download. `scheme://` is not a remote spec, and two letters minimum keeps a Windows drive
+# (`C:`) out.
 COPY_TOOL_PATTERN = re.compile(r"(?<![\w-])(?:scp|rsync)(?![\w-])")
 REMOTE_SPEC_PATTERN = re.compile(r"^(?:[\w.+-]+@)?(?P<host>[A-Za-z0-9.-]{2,}):(?!//)")
-
-# Tools that write to disk reach no host: a URL in their arguments (a config example,
-# a docstring) is content, not a target the call contacts. Matched by exact name so a
-# reaching tool cannot earn the exemption by having "edit" in its name.
-FILE_WRITE_TOOL = re.compile(
-    r"(?i)^(?:write|edit|multi_?edit|notebook_?edit|create_?file|write_?file|save_?file|"
-    r"append_?file|str_?replace(?:_\w+)?|apply_?patch|fs_?write|fs_?append)$"
-)
 
 # --- Judge ---
 

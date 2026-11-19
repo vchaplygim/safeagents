@@ -17,20 +17,22 @@ from __future__ import annotations
 
 import ipaddress
 import json
-from collections.abc import Iterable, Iterator
+from collections.abc import Iterable
 
 from .constants import (
     AUTHORITY_PATTERN,
     COPY_TOOL_PATTERN,
+    CURL_UPLOAD_PATTERN,
     DEFAULT_ALLOWED_HOSTS,
-    FILE_WRITE_TOOL,
     HOST_PATTERN,
-    HTTP_UPLOAD_PATTERN,
     IPV4_PATTERN,
+    NETWORK_PATTERN,
+    NETWORK_TOOL_PATTERN,
     REMOTE_SPEC_PATTERN,
+    RESERVED_HOSTS,
     SEGMENT_SPLIT,
+    WGET_UPLOAD_PATTERN,
 )
-from .utils import content_text
 
 
 def declared_tools(request: dict) -> set[str]:
@@ -61,23 +63,28 @@ def extract_hosts(text: str) -> list[str]:
     return sorted(hosts)
 
 
-def sourced_hosts(request: dict) -> set[str]:
-    """Hosts the human put in play: those named in the user, system and developer turns.
+def call_text(args: str) -> str:
+    """The text a call's raw JSON arguments carry: every string value, decoded (a command's newlines are real again).
 
-    Assistant turns and tool results are excluded on purpose. A host the model wrote
-    earlier is no more sourced than one it writes now, and a host that only appears in
-    a tool's output can be laundered into one by a call that echoes it back.
-    """
-    hosts: set[str] = set()
-    hosts.update(extract_hosts(content_text(request.get("system"))))
-    for message in request.get("messages") or []:
-        if not isinstance(message, dict):
-            continue
-        if message.get("role") in ("user", "system", "developer"):
-            # content_text keeps only text/input_text blocks, so Anthropic tool_result
-            # blocks carried on a user message are dropped here.
-            hosts.update(extract_hosts(content_text(message.get("content"))))
-    return hosts
+    Matching the raw JSON instead reads an escaped newline before `cat` as `ncat`, a network client."""
+    try:
+        value = json.loads(args)
+    except ValueError:
+        return args
+    strings = []
+
+    def walk(item):
+        if isinstance(item, str):
+            strings.append(item)
+        elif isinstance(item, dict):
+            for nested in item.values():
+                walk(nested)
+        elif isinstance(item, list):
+            for nested in item:
+                walk(nested)
+
+    walk(value)
+    return "\n".join(strings)
 
 
 def host_allowed(host: str, allowed: Iterable[str]) -> bool:
@@ -96,36 +103,18 @@ def is_loopback(host: str) -> bool:
     return address.is_loopback or address.is_unspecified
 
 
-def argument_texts(args: str) -> list[str]:
-    """The string values in a call's JSON arguments (the raw text if it isn't JSON)."""
-    try:
-        parsed = json.loads(args)
-    except ValueError:
-        return [args]
-
-    def strings(value: object) -> Iterator[str]:
-        if isinstance(value, str):
-            yield value
-        elif isinstance(value, dict):
-            for item in value.values():
-                yield from strings(item)
-        elif isinstance(value, list):
-            for item in value:
-                yield from strings(item)
-
-    return list(strings(parsed))
-
-
 def segment_targets(segment: str) -> tuple[list[str], list[str]]:
-    """The hosts one shell segment reaches and the hosts it uploads to."""
-    hosts = extract_hosts(segment)
-    if HTTP_UPLOAD_PATTERN.search(segment):
-        return [], hosts
+    """The scp/rsync remotes one shell segment reaches, and the hosts it uploads to.
+
+    URL hosts a segment merely reaches are left to the host rule; this adds what it cannot
+    see (`user@host:path` remotes) and what it does not tell apart (a request with a body)."""
+    if CURL_UPLOAD_PATTERN.search(segment) or WGET_UPLOAD_PATTERN.search(segment):
+        return [], extract_hosts(segment)
     copy = COPY_TOOL_PATTERN.search(segment)
     if copy is None:
-        return hosts, []
+        return [], []
     operands = [token.strip("\"'") for token in segment[copy.end() :].split() if not token.startswith("-")]
-    reached, uploaded = list(hosts), []
+    reached, uploaded = [], []
     for index, operand in enumerate(operands):
         remote = REMOTE_SPEC_PATTERN.match(operand)
         if remote is not None:
@@ -144,33 +133,52 @@ class Policy:
         upload_hosts: Iterable[str] = (),
     ):
         self.declared = declared_tools(request)
-        self.sourced = sourced_hosts(request)
-        self.allowed_hosts = [host.lower() for host in allowed_hosts]
-        # Hosts a call may send data to. The GET allowlist (package registries and the
-        # like) does not grant uploads, and merely naming a host in the chat does not
-        # authorise exfiltrating to it, so this list is separate and empty by default.
+        # The request without the model's own turns: a host the model wrote earlier
+        # is no more sourced than one it writes now.
+        context = dict(request)
+        if isinstance(context.get("messages"), list):
+            context["messages"] = [
+                message
+                for message in context["messages"]
+                if not (isinstance(message, dict) and message.get("role") == "assistant")
+            ]
+        self.context = json.dumps(context, ensure_ascii=False).lower()
+        self.allowed_hosts = [host.lower() for host in (*allowed_hosts, *RESERVED_HOSTS)]
+        # Hosts a call may send data to. Being allowed to reach a host, or seeing it named in the conversation, does
+        # not allow sending data there, so this list is separate and empty by default.
         self.upload_hosts = [host.lower() for host in upload_hosts]
 
     def check(self, name: str, args: str) -> str | None:
         """Why a call to `name` with raw `args` should be blocked, if it should."""
         if name not in self.declared:
             return "undeclared tool"
-        # Writing a host into a file contacts nothing; the host rule is about reaching one.
-        if FILE_WRITE_TOOL.match(name):
+        # A host only matters in a call that can reach it: one in a file the call writes is data
+        text = call_text(args)
+        network_tool = NETWORK_TOOL_PATTERN.search(name)
+        if not (network_tool or NETWORK_PATTERN.search(text)):
             return None
-        reached: list[str] = []
-        uploaded: list[str] = []
-        for text in argument_texts(args):
-            for segment in SEGMENT_SPLIT.split(text):
-                segment_reached, segment_uploaded = segment_targets(segment)
-                reached += segment_reached
-                uploaded += segment_uploaded
-        for host in uploaded:
-            if is_loopback(host) or host_allowed(host, self.upload_hosts):
+        # Sending data is judged per shell segment, so a POST to a local server does not turn a GET elsewhere in the
+        # same command into an upload.
+        remotes: set[str] = set()
+        uploaded: set[str] = set()
+        for segment in SEGMENT_SPLIT.split(text):
+            segment_reached, segment_uploaded = segment_targets(segment)
+            remotes.update(segment_reached)
+            uploaded.update(segment_uploaded)
+        for host in sorted(uploaded):
+            if not (is_loopback(host) or host_allowed(host, self.upload_hosts)):
+                return f"host `{host}` receives uploaded data but is not an allowed upload target"
+        # A URL's host counts anywhere in such a call (code often names the URL a line before it opens it). A bare IP
+        # counts only on a line that reaches out: elsewhere it is data, like the log lines of a test fixture.
+        reaching = (
+            text if network_tool else "\n".join(line for line in text.splitlines() if NETWORK_PATTERN.search(line))
+        )
+        url_hosts = [host for host in extract_hosts(text) if not IPV4_PATTERN.fullmatch(host)]
+        # A host cleared for uploads can be reached too: sending data there means connecting to it.
+        for host in sorted({*url_hosts, *extract_hosts(reaching), *remotes} - uploaded):
+            if host in self.context:
                 continue
-            return f"host `{host}` receives uploaded data but is not an allowed upload target"
-        for host in reached:
-            if host_allowed(host, self.sourced) or host_allowed(host, self.allowed_hosts):
+            if host_allowed(host, self.allowed_hosts):
                 continue
             return f"host `{host}` appears nowhere in the conversation"
         return None

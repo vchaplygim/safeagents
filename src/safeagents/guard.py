@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 
@@ -34,6 +35,8 @@ from .judge import Judge, JudgeError, task_text
 from .monitor import Monitor
 from .policy import Policy
 from .scan import Scanner, Signal, history, recent
+from .selfprotect import self_protection_reason
+from .sinks import Sink, SinkDispatcher
 from .utils import compact_json
 
 logger = logging.getLogger("safeagents")
@@ -43,6 +46,9 @@ logger = logging.getLogger("safeagents")
 class Config:
     # Replace flagged tool calls instead of only logging them.
     block: bool = True
+    # Block calls the agent makes against the proxy itself (stop/kill it, edit its
+    # journal, redirect the harness, drop an allowance). Not excusable by a plugin.
+    self_protection: bool = True
     # Hosts tool calls may reach even if the conversation never mentions them.
     allowed_hosts: Sequence[str] = DEFAULT_ALLOWED_HOSTS
     # Hosts tool calls may upload to. The reach allowlist above does not grant uploads,
@@ -58,6 +64,18 @@ class Config:
     monitor: Monitor | None = None
     # Keeps calls that weren't simply passed, for `safeagents inspect`.
     journal: Journal | None = None
+    # Trusted callbacks receive journal-shaped data, including arguments/task.
+    sinks: Sequence[Sink] = field(default=(), repr=False)
+    _sink_dispatcher: SinkDispatcher | None = field(init=False, default=None, repr=False)
+
+    def __post_init__(self) -> None:
+        if self.sinks:
+            self._sink_dispatcher = SinkDispatcher(tuple(self.sinks))
+
+    def close_sinks(self) -> None:
+        """Stop best-effort delivery without waiting for callback code."""
+        if self._sink_dispatcher is not None:
+            self._sink_dispatcher.close()
 
 
 @dataclass(frozen=True)
@@ -102,6 +120,12 @@ class Guard:
     async def review(self, name: str, args: str) -> Review:
         """Reviews a complete call without blocking, logging or recording it."""
         self._calls.append((name, args))
+        # Self-protection runs first and outside the scanner, so a plugin allowance,
+        # which only excuses atif-scan findings, cannot lift it.
+        if self.config.self_protection:
+            self_reason = self_protection_reason(name, args)
+            if self_reason is not None:
+                return Review(self_reason)
         policy_reason = self.policy.check(name, args)
         if policy_reason is not None:
             return Review(policy_reason)
@@ -119,21 +143,27 @@ class Guard:
 
         call_id = None
         journal = self.config.journal
-        if verdict != "passed" and journal is not None:
+        dispatcher = self.config._sink_dispatcher
+        if verdict != "passed" and (journal is not None or dispatcher is not None):
             journal_signals = [
                 {"id": signal.id, "severity": signal.severity.name.lower(), "title": signal.title}
                 for signal in review.signals
             ]
-            call_id = journal.append(
-                verdict=verdict,
-                tool=name,
-                arguments=args,
-                reason=review.reason,
-                signals=journal_signals,
-                judge=review.judge,
-                model=str(self.request.get("model") or ""),
-                task=task_text(self.request),
-            )
+            entry = {
+                "time": time.time(),
+                "verdict": verdict,
+                "tool": name,
+                "arguments": args,
+                "reason": review.reason,
+                "signals": journal_signals,
+                "judge": review.judge,
+                "model": str(self.request.get("model") or ""),
+                "task": task_text(self.request),
+            }
+            if journal is not None:
+                call_id = journal.append(**entry)
+            if dispatcher is not None:
+                dispatcher.publish({"id": call_id, **entry})
 
         monitor = self.config.monitor
         if monitor is not None:
@@ -149,15 +179,23 @@ class Guard:
         scanner = self.config.scanner
         if scanner is None:
             return Review()
-        if self._steps is None:
-            self._steps = recent(history(self.request))
-        signals = scanner.signals(self._steps, self._calls)
+        # atif-scan is synchronous and CPU-bound (regex and rules over the whole trace),
+        # so run it in a worker thread: on the single proxy event loop a slow scan would
+        # otherwise stall every other in-flight request until it finished. The calls are
+        # copied here, on the loop, so the thread never reads a list the loop appends to.
+        signals = await asyncio.to_thread(self._signals, scanner, list(self._calls))
         severe_signals = [signal for signal in signals if signal.severity >= self.config.block_severity]
         if severe_signals:
             return Review("atif-scan: " + ", ".join(str(signal) for signal in severe_signals), signals)
         if not signals:
             return Review()
         return await self._judge(name, args, signals)
+
+    def _signals(self, scanner: Scanner, calls: list[tuple[str, str]]) -> list[Signal]:
+        """The scanner's findings on `calls`. Synchronous; called via a thread."""
+        if self._steps is None:
+            self._steps = recent(history(self.request))
+        return scanner.signals(self._steps, calls)
 
     async def _judge(self, name: str, args: str, signals: list[Signal]) -> Review:
         judge = self.config.judge
